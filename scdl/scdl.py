@@ -9,7 +9,7 @@ Usage:
     [--original-name][--original-metadata][--no-original][--only-original]
     [--name-format <format>][--strict-playlist][--playlist-name-format <format>]
     [--client-id <id>][--auth-token <token>][--overwrite][--no-playlist][--opus]
-    [--add-description]
+    [--add-description][--concurrent <threads>]
 
     scdl -h | --help
     scdl --version
@@ -71,10 +71,12 @@ Options:
     --no-playlist                   Skip downloading playlists
     --add-description               Adds the description to a separate txt file
     --opus                          Prefer downloading opus streams over mp3 streams
+    --concurrent [threads]          Number of concurrent downloads (default: 1, max: 10)
 """
 
 import atexit
 import configparser
+import concurrent.futures
 import contextlib
 import io
 import itertools
@@ -155,6 +157,7 @@ class SCDLArgs(TypedDict):
     auth_token: Optional[str]
     c: bool
     client_id: Optional[str]
+    concurrent: Optional[int]
     debug: bool
     download_archive: Optional[str]
     error: bool
@@ -351,6 +354,22 @@ def main() -> None:
             sys.exit(1)
         logger.debug("max-size: %d", arguments["--max-size"])
 
+    if arguments["--concurrent"] is not None:
+        try:
+            concurrent_threads = int(arguments["--concurrent"])
+            if concurrent_threads < 1:
+                raise ValueError("Concurrent threads must be at least 1")
+            if concurrent_threads > 10:
+                logger.warning("Maximum concurrent threads is 10, setting to 10")
+                concurrent_threads = 10
+            arguments["--concurrent"] = concurrent_threads
+        except ValueError:
+            logger.error("Concurrent threads should be a positive integer between 1 and 10")
+            sys.exit(1)
+        logger.debug("concurrent threads: %d", arguments["--concurrent"])
+    else:
+        arguments["--concurrent"] = 1  # Default to single-threaded
+
     if arguments["--hidewarnings"]:
         warnings.filterwarnings("ignore")
 
@@ -516,65 +535,140 @@ def download_url(client: SoundCloud, kwargs: SCDLArgs) -> None:
         logger.info("Found a user profile")
         if kwargs.get("f"):
             logger.info(f"Retrieving all likes of user {user.username}...")
-            likes = client.get_user_likes(user.id, limit=1000)
-            for i, like in itertools.islice(enumerate(likes, 1), offset, None):
-                logger.info(f"like n°{i} of {user.likes_count}")
-                if isinstance(like, TrackLike):
+            likes = list(itertools.islice(
+                client.get_user_likes(user.id, limit=1000), 
+                offset, 
+                None
+            ))
+            
+            # Separate tracks from playlists
+            track_likes = [like.track for like in likes if isinstance(like, TrackLike)]
+            playlist_likes = [like for like in likes if isinstance(like, PlaylistLike)]
+            
+            # Download tracks concurrently if enabled
+            if track_likes and kwargs.get("concurrent", 1) > 1:
+                download_tracks_concurrently(
+                    client,
+                    track_likes,
+                    kwargs,
+                    None,  # No playlist info for user likes
+                    kwargs["strict_playlist"],
+                )
+            else:
+                # Sequential download for tracks
+                for track in track_likes:
                     download_track(
                         client,
-                        like.track,
+                        track,
                         kwargs,
                         exit_on_fail=kwargs["strict_playlist"],
                     )
-                elif isinstance(like, PlaylistLike):
-                    playlist = client.get_playlist(like.playlist.id)
-                    assert playlist is not None
-                    download_playlist(client, playlist, kwargs)
-                else:
-                    logger.error(f"Unknown like type {like}")
-                    if kwargs.get("strict_playlist"):
-                        sys.exit(1)
+            
+            # Download playlists (sequential)
+            for like in playlist_likes:
+                playlist = client.get_playlist(like.playlist.id)
+                assert playlist is not None
+                download_playlist(client, playlist, kwargs)
             logger.info(f"Downloaded all likes of user {user.username}!")
         elif kwargs.get("C"):
             logger.info(f"Retrieving all commented tracks of user {user.username}...")
-            comments = client.get_user_comments(user.id, limit=1000)
-            for i, comment in itertools.islice(enumerate(comments, 1), offset, None):
-                logger.info(f"comment n°{i} of {user.comments_count}")
+            comments = list(itertools.islice(
+                client.get_user_comments(user.id, limit=1000), 
+                offset, 
+                None
+            ))
+            
+            # Get all tracks from comments
+            tracks = []
+            for comment in comments:
                 track = client.get_track(comment.track.id)
-                assert track is not None
-                download_track(
+                if track is not None:
+                    tracks.append(track)
+            
+            if tracks and kwargs.get("concurrent", 1) > 1:
+                download_tracks_concurrently(
                     client,
-                    track,
+                    tracks,
                     kwargs,
-                    exit_on_fail=kwargs["strict_playlist"],
+                    None,  # No playlist info for user comments
+                    kwargs["strict_playlist"],
                 )
-            logger.info(f"Downloaded all commented tracks of user {user.username}!")
-        elif kwargs.get("t"):
-            logger.info(f"Retrieving all tracks of user {user.username}...")
-            tracks = client.get_user_tracks(user.id, limit=1000)
-            for i, track in itertools.islice(enumerate(tracks, 1), offset, None):
-                logger.info(f"track n°{i} of {user.track_count}")
-                download_track(client, track, kwargs, exit_on_fail=kwargs["strict_playlist"])
-            logger.info(f"Downloaded all tracks of user {user.username}!")
-        elif kwargs.get("a"):
-            logger.info(f"Retrieving all tracks & reposts of user {user.username}...")
-            items = client.get_user_stream(user.id, limit=1000)
-            for i, stream_item in itertools.islice(enumerate(items, 1), offset, None):
-                logger.info(
-                    f"item n°{i} of "
-                    f"{user.track_count + user.reposts_count if user.reposts_count else '?'}",
-                )
-                if isinstance(stream_item, (TrackStreamItem, TrackStreamRepostItem)):
+            else:
+                for i, track in enumerate(tracks, 1):
+                    logger.info(f"comment n°{i + offset} of {user.comments_count}")
                     download_track(
                         client,
-                        stream_item.track,
+                        track,
                         kwargs,
                         exit_on_fail=kwargs["strict_playlist"],
                     )
-                elif isinstance(stream_item, (PlaylistStreamItem, PlaylistStreamRepostItem)):
-                    download_playlist(client, stream_item.playlist, kwargs)
-                else:
-                    logger.error(f"Unknown item type {stream_item.type}")
+            logger.info(f"Downloaded all commented tracks of user {user.username}!")
+        elif kwargs.get("t"):
+            logger.info(f"Retrieving all tracks of user {user.username}...")
+            tracks = list(itertools.islice(
+                client.get_user_tracks(user.id, limit=1000), 
+                offset, 
+                None
+            ))
+            
+            if kwargs.get("concurrent", 1) > 1:
+                download_tracks_concurrently(
+                    client,
+                    tracks,
+                    kwargs,
+                    None,  # No playlist info for user tracks
+                    kwargs["strict_playlist"],
+                )
+            else:
+                for i, track in enumerate(tracks, 1):
+                    logger.info(f"track n°{i + offset} of {user.track_count}")
+                    download_track(client, track, kwargs, exit_on_fail=kwargs["strict_playlist"])
+            logger.info(f"Downloaded all tracks of user {user.username}!")
+        elif kwargs.get("a"):
+            logger.info(f"Retrieving all tracks & reposts of user {user.username}...")
+            items = list(itertools.islice(
+                client.get_user_stream(user.id, limit=1000), 
+                offset, 
+                None
+            ))
+            
+            # Separate tracks from playlists
+            track_items = [
+                item.track for item in items 
+                if isinstance(item, (TrackStreamItem, TrackStreamRepostItem))
+            ]
+            playlist_items = [
+                item for item in items 
+                if isinstance(item, (PlaylistStreamItem, PlaylistStreamRepostItem))
+            ]
+            
+            # Download tracks concurrently if enabled
+            if track_items and kwargs.get("concurrent", 1) > 1:
+                download_tracks_concurrently(
+                    client,
+                    track_items,
+                    kwargs,
+                    None,  # No playlist info for user stream
+                    kwargs["strict_playlist"],
+                )
+            else:
+                # Sequential download for tracks
+                for item in [i for i in items if isinstance(i, (TrackStreamItem, TrackStreamRepostItem))]:
+                    download_track(
+                        client,
+                        item.track,
+                        kwargs,
+                        exit_on_fail=kwargs["strict_playlist"],
+                    )
+            
+            # Download playlists (sequential)
+            for item in playlist_items:
+                download_playlist(client, item.playlist, kwargs)
+            
+            # Handle unknown items
+            for item in items:
+                if not isinstance(item, (TrackStreamItem, TrackStreamRepostItem, PlaylistStreamItem, PlaylistStreamRepostItem)):
+                    logger.error(f"Unknown item type {item.type}")
                     if kwargs.get("strict_playlist"):
                         sys.exit(1)
             logger.info(f"Downloaded all tracks & reposts of user {user.username}!")
@@ -587,19 +681,48 @@ def download_url(client: SoundCloud, kwargs: SCDLArgs) -> None:
             logger.info(f"Downloaded all playlists of user {user.username}!")
         elif kwargs.get("r"):
             logger.info(f"Retrieving all reposts of user {user.username}...")
-            reposts = client.get_user_reposts(user.id, limit=1000)
-            for i, repost in itertools.islice(enumerate(reposts, 1), offset, None):
-                logger.info(f"item n°{i} of {user.reposts_count or '?'}")
-                if isinstance(repost, TrackStreamRepostItem):
+            reposts = list(itertools.islice(
+                client.get_user_reposts(user.id, limit=1000), 
+                offset, 
+                None
+            ))
+            
+            # Separate tracks from playlists
+            track_reposts = [
+                repost.track for repost in reposts 
+                if isinstance(repost, TrackStreamRepostItem)
+            ]
+            playlist_reposts = [
+                repost for repost in reposts 
+                if isinstance(repost, PlaylistStreamRepostItem)
+            ]
+            
+            # Download tracks concurrently if enabled
+            if track_reposts and kwargs.get("concurrent", 1) > 1:
+                download_tracks_concurrently(
+                    client,
+                    track_reposts,
+                    kwargs,
+                    None,  # No playlist info for user reposts
+                    kwargs["strict_playlist"],
+                )
+            else:
+                # Sequential download for tracks
+                for repost in [r for r in reposts if isinstance(r, TrackStreamRepostItem)]:
                     download_track(
                         client,
                         repost.track,
                         kwargs,
                         exit_on_fail=kwargs["strict_playlist"],
                     )
-                elif isinstance(repost, PlaylistStreamRepostItem):
-                    download_playlist(client, repost.playlist, kwargs)
-                else:
+            
+            # Download playlists (sequential)
+            for repost in playlist_reposts:
+                download_playlist(client, repost.playlist, kwargs)
+            
+            # Handle unknown items
+            for repost in reposts:
+                if not isinstance(repost, (TrackStreamRepostItem, PlaylistStreamRepostItem)):
                     logger.error(f"Unknown item type {repost.type}")
                     if kwargs.get("strict_playlist"):
                         sys.exit(1)
@@ -726,28 +849,48 @@ def download_playlist(
                 sys.exit(1)
 
         tracknumber_digits = len(str(len(playlist.tracks)))
+        
+        # Prepare tracks for download, resolving MiniTracks to BasicTracks
+        tracks_to_download = []
+        track_positions = []  # Store original positions for proper track numbering
         for counter, track in itertools.islice(
             enumerate(playlist.tracks, 1),
             kwargs.get("playlist_offset", 0),
             None,
         ):
             logger.debug(track)
-            logger.info(f"Track n°{counter}")
-            playlist_info["tracknumber_int"] = counter
-            playlist_info["tracknumber"] = str(counter).zfill(tracknumber_digits)
             if isinstance(track, MiniTrack):
                 if playlist.secret_token:
                     track = client.get_tracks([track.id], playlist.id, playlist.secret_token)[0]
                 else:
                     track = client.get_track(track.id)  # type: ignore[assignment]
             assert isinstance(track, BasicTrack)
-            download_track(
+            tracks_to_download.append(track)
+            track_positions.append(counter)  # Store the original position
+        
+        # Download tracks (concurrently if enabled)
+        if kwargs.get("concurrent", 1) > 1:
+            download_tracks_concurrently(
                 client,
-                track,
+                tracks_to_download,
                 kwargs,
                 playlist_info,
                 kwargs["strict_playlist"],
+                track_positions,  # Pass the original positions
             )
+        else:
+            # Sequential download (original behavior)
+            for i, (track, counter) in enumerate(zip(tracks_to_download, track_positions), 1):
+                logger.info(f"Track n°{counter}")
+                playlist_info["tracknumber_int"] = counter
+                playlist_info["tracknumber"] = str(counter).zfill(tracknumber_digits)
+                download_track(
+                    client,
+                    track,
+                    kwargs,
+                    playlist_info,
+                    kwargs["strict_playlist"],
+                )
     finally:
         if not kwargs.get("no_playlist_folder"):
             os.chdir("..")
@@ -1611,5 +1754,90 @@ def get_ffmpeg_supported_options() -> Set[str]:
     return supported
 
 
-if __name__ == "__main__":
-    main()
+def download_track_wrapper(args: Tuple) -> Optional[str]:
+    """Wrapper function for downloading a single track in a thread"""
+    client, track, kwargs, playlist_info, exit_on_fail = args
+    try:
+        download_track(client, track, kwargs, playlist_info, exit_on_fail)
+        return None  # Success
+    except Exception as e:
+        logger.error(f"Error downloading track {track.title}: {e}")
+        if exit_on_fail:
+            raise
+        return str(e)
+
+
+def download_tracks_concurrently(
+    client: SoundCloud,
+    tracks: List[Union[BasicTrack, Track]],
+    kwargs: SCDLArgs,
+    playlist_info_base: Optional[PlaylistInfo] = None,
+    exit_on_fail: bool = False,
+    track_positions: Optional[List[int]] = None,
+) -> None:
+    """Download multiple tracks concurrently using ThreadPoolExecutor"""
+    max_workers = kwargs.get("concurrent", 1)
+    
+    # Safety checks for concurrent downloads
+    if kwargs.get("name_format") == "-":
+        logger.warning("Concurrent downloads disabled when downloading to stdout")
+        max_workers = 1
+    
+    if max_workers == 1:
+        # Fall back to sequential processing
+        for i, track in enumerate(tracks, 1):
+            track_position = track_positions[i-1] if track_positions else i
+            logger.info(f"Track n°{track_position}")
+            if playlist_info_base:
+                playlist_info = playlist_info_base.copy()
+                playlist_info["tracknumber_int"] = track_position
+                tracknumber_digits = len(str(len(tracks) + (track_positions[0] - 1 if track_positions else 0)))
+                playlist_info["tracknumber"] = str(track_position).zfill(tracknumber_digits)
+            else:
+                playlist_info = None
+            
+            download_track(client, track, kwargs, playlist_info, exit_on_fail)
+        return
+    
+    logger.info(f"Starting concurrent download with {max_workers} threads...")
+    
+    # Prepare track arguments
+    track_args = []
+    for i, track in enumerate(tracks, 1):
+        track_position = track_positions[i-1] if track_positions else i
+        if playlist_info_base:
+            playlist_info = playlist_info_base.copy()
+            playlist_info["tracknumber_int"] = track_position
+            # Calculate total digits based on total playlist size, not just remaining tracks
+            total_tracks = playlist_info_base["tracknumber_total"]
+            tracknumber_digits = len(str(total_tracks))
+            playlist_info["tracknumber"] = str(track_position).zfill(tracknumber_digits)
+        else:
+            playlist_info = None
+        
+        track_args.append((client, track, kwargs, playlist_info, exit_on_fail))
+    
+    # Download tracks concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all download tasks
+        future_to_track = {
+            executor.submit(download_track_wrapper, args): args[1] 
+            for args in track_args
+        }
+        
+        # Process completed downloads
+        for future in concurrent.futures.as_completed(future_to_track):
+            track = future_to_track[future]
+            try:
+                error = future.result()
+                if error is None:
+                    logger.info(f"✓ Completed: {track.title}")
+                else:
+                    logger.error(f"✗ Failed: {track.title} - {error}")
+            except Exception as exc:
+                logger.error(f"✗ Exception for {track.title}: {exc}")
+                if exit_on_fail:
+                    # Cancel remaining tasks
+                    for f in future_to_track:
+                        f.cancel()
+                    raise
